@@ -57,14 +57,14 @@ interface FbError {
 function extractError(err: unknown): string {
   if (axios.isAxiosError(err) && err.response?.data?.error) {
     const e = err.response.data.error as FbError;
-    return `Facebook API hiba (${e.code}): ${e.message}`;
+    return "Facebook API hiba (" + e.code + "): " + e.message;
   }
   return err instanceof Error ? err.message : String(err);
 }
 
 function createClient(creds: Credentials): AxiosInstance {
   return axios.create({
-    baseURL: `https://graph.facebook.com/${creds.apiVersion}`,
+    baseURL: "https://graph.facebook.com/" + creds.apiVersion,
     params: { access_token: creds.pageToken },
     timeout: 30000,
   });
@@ -74,7 +74,7 @@ function assertCredentials(creds: Credentials): void {
   const missing: string[] = [];
   if (!creds.pageToken) missing.push("FB_PAGE_ACCESS_TOKEN (x-fb-page-access-token header)");
   if (!creds.pageId) missing.push("FB_PAGE_ID (x-fb-page-id header)");
-  if (missing.length) throw new Error(`Hianyzo hitelesito adatok: ${missing.join(", ")}`);
+  if (missing.length) throw new Error("Hianyzo hitelesito adatok: " + missing.join(", "));
 }
 
 async function uploadPhotoToFacebook(
@@ -89,7 +89,7 @@ async function uploadPhotoToFacebook(
 ): Promise<{ id: string; post_id?: string }> {
   const ext = mimeType.split("/")[1] ?? "png";
   const fd = new globalThis.FormData();
-  fd.append("source", new Blob([imageBuffer], { type: mimeType }), "photo." + ext);
+  fd.append("source", new Blob([new Uint8Array(imageBuffer)], { type: mimeType }), "photo." + ext);
   fd.append("message", message);
   fd.append("published", String(published));
   fd.append("access_token", pageToken);
@@ -106,7 +106,7 @@ async function uploadPhotoToFacebook(
 }
 
 function createMcpServer(creds: Credentials): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "2.2.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "2.3.0" });
 
   server.tool("list_posts", "Visszaadja az oldal legutobb bejegyzeseit.", {
     limit: z.number().int().min(1).max(100).optional().default(10),
@@ -343,6 +343,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", [
     "Content-Type","Accept","Mcp-Session-Id","MCP-Protocol-Version",
     "x-api-key","x-fb-page-access-token","x-fb-page-id","x-fb-app-id","x-fb-app-secret","x-fb-api-version",
+    "x-message","x-published","x-scheduled-time",
   ].join(", "));
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
@@ -356,7 +357,41 @@ function requireApiKey(req: Request, res: Response, next: () => void): void {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "meta-marketing-agent", version: "2.2.0" });
+  res.json({ status: "ok", service: "meta-marketing-agent", version: "2.3.0" });
+});
+
+// REST endpoint: POST /upload-image
+// Accept raw binary image in body, credentials in headers
+// curl -X POST .../upload-image -H "Content-Type: image/png" -H "x-message: TEXT" -H "x-fb-page-id: ID" -H "x-fb-page-access-token: TOKEN" --data-binary @image.png
+app.post("/upload-image", requireApiKey, express.raw({ type: ["image/*", "application/octet-stream"], limit: "10mb" }), async (req: Request, res: Response) => {
+  const creds = getCredentials(req);
+  try {
+    assertCredentials(creds);
+    const imageBuffer = req.body as Buffer;
+    if (!imageBuffer || imageBuffer.length === 0) {
+      res.status(400).json({ success: false, error: "Nincs kepfajl a request body-ban. Kuldd a kepet raw binary-kent (Content-Type: image/png stb.)" });
+      return;
+    }
+    const mimeType = ((req.headers["content-type"] as string) ?? "image/jpeg").split(";")[0].trim();
+    const message = (req.headers["x-message"] as string) ?? "";
+    const published = (req.headers["x-published"] as string) !== "false";
+    let scheduledTs: number | undefined;
+    const scheduledTime = req.headers["x-scheduled-time"] as string;
+    if (!published && scheduledTime) {
+      scheduledTs = Math.floor(new Date(scheduledTime).getTime() / 1000);
+      if (isNaN(scheduledTs)) {
+        res.status(400).json({ success: false, error: "Ervenytelen x-scheduled-time formatum." });
+        return;
+      }
+    }
+    const result = await uploadPhotoToFacebook(
+      creds.apiVersion, creds.pageId, creds.pageToken,
+      imageBuffer, mimeType, message, published, scheduledTs
+    );
+    res.json({ success: true, photo_id: result.id, post_id: result.post_id ?? null });
+  } catch (err) {
+    res.status(500).json({ success: false, error: extractError(err) });
+  }
 });
 
 app.post("/mcp", requireApiKey, async (req: Request, res: Response) => {
