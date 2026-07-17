@@ -4,15 +4,13 @@
   "description": "MCP szerver a Facebook Graph API-hoz – bejegyzések kezelése",
   "type": "module",
   "main": "dist/index.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "axios": "^1.7.0",
     "dotenv": "^16.4.0",
