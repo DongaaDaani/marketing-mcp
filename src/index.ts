@@ -66,7 +66,7 @@ function createClient(creds: Credentials): AxiosInstance {
   return axios.create({
     baseURL: `https://graph.facebook.com/${creds.apiVersion}`,
     params: { access_token: creds.pageToken },
-    timeout: 15000,
+    timeout: 30000,
   });
 }
 
@@ -77,10 +77,38 @@ function assertCredentials(creds: Credentials): void {
   if (missing.length) throw new Error(`Hianyzo hitelesito adatok: ${missing.join(", ")}`);
 }
 
+async function uploadPhotoToFacebook(
+  apiVersion: string,
+  pageId: string,
+  pageToken: string,
+  imageBuffer: Buffer,
+  mimeType: string,
+  message: string,
+  published: boolean,
+  scheduledTs?: number
+): Promise<{ id: string; post_id?: string }> {
+  const ext = mimeType.split("/")[1] ?? "png";
+  const fd = new globalThis.FormData();
+  fd.append("source", new Blob([imageBuffer], { type: mimeType }), "photo." + ext);
+  fd.append("message", message);
+  fd.append("published", String(published));
+  fd.append("access_token", pageToken);
+  if (!published && scheduledTs !== undefined) {
+    fd.append("scheduled_publish_time", String(scheduledTs));
+  }
+  const url = "https://graph.facebook.com/" + apiVersion + "/" + pageId + "/photos";
+  const fetchRes = await fetch(url, { method: "POST", body: fd });
+  if (!fetchRes.ok) {
+    const errBody = await fetchRes.text();
+    throw new Error("Facebook API hiba (" + fetchRes.status + "): " + errBody);
+  }
+  return fetchRes.json() as Promise<{ id: string; post_id?: string }>;
+}
+
 function createMcpServer(creds: Credentials): McpServer {
   const server = new McpServer({ name: "meta-marketing-agent", version: "2.2.0" });
 
-  server.tool("list_posts", "Visszaadja az oldal legutóbbi bejegyzéseit.", {
+  server.tool("list_posts", "Visszaadja az oldal legutobb bejegyzeseit.", {
     limit: z.number().int().min(1).max(100).optional().default(10),
     include_scheduled: z.boolean().optional().default(false),
   }, async ({ limit, include_scheduled }) => {
@@ -89,8 +117,8 @@ function createMcpServer(creds: Credentials): McpServer {
     try {
       const fields = "id,message,story,created_time,is_published,scheduled_publish_time,full_picture,permalink_url";
       const requests = [
-        client.get(`/${creds.pageId}/posts`, { params: { fields, limit } }),
-        ...(include_scheduled ? [client.get(`/${creds.pageId}/scheduled_posts`, { params: { fields, limit } })] : []),
+        client.get("/" + creds.pageId + "/posts", { params: { fields, limit } }),
+        ...(include_scheduled ? [client.get("/" + creds.pageId + "/scheduled_posts", { params: { fields, limit } })] : []),
       ];
       const results = await Promise.all(requests);
       const published: FbPost[] = results[0].data.data ?? [];
@@ -107,7 +135,7 @@ function createMcpServer(creds: Credentials): McpServer {
       const all = [...published.map(p => fmt(p, "kozzetett")), ...scheduled.map(p => fmt(p, "utemezett"))];
       return { content: [{ type: "text", text: JSON.stringify({ total: all.length, posts: all }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -118,14 +146,14 @@ function createMcpServer(creds: Credentials): McpServer {
     const client = createClient(creds);
     try {
       const fields = "id,message,story,created_time,is_published,scheduled_publish_time,full_picture,permalink_url,likes.summary(true),comments.summary(true),shares";
-      const { data } = await client.get(`/${post_id}`, { params: { fields } });
+      const { data } = await client.get("/" + post_id, { params: { fields } });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
-  server.tool("create_post", "Uj bejegyzest tesz kozzé az oldalon képpel vagy anelkul, vagy utemezi. A kep megadhato base64 kodolt stringkent (image_base64), nyilvanos URL-kent (image_url), vagy link-kent.", {
+  server.tool("create_post", "Uj bejegyzest tesz koze az oldalon kepel vagy anelkul, vagy utemezi. A kep megadhato base64 kodolt stringkent (image_base64), nyilvanos URL-kent (image_url), vagy link-kent.", {
     message: z.string().min(1).max(63206),
     image_base64: z.string().optional(),
     image_mime_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]).optional().default("image/png"),
@@ -139,78 +167,48 @@ function createMcpServer(creds: Credentials): McpServer {
     assertCredentials(creds);
     const client = createClient(creds);
     try {
+      let scheduledTs: number | undefined;
+      if (!published && scheduled_publish_time) {
+        scheduledTs = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
+        if (isNaN(scheduledTs)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
+      }
+
       if (image_base64) {
         const buffer = Buffer.from(image_base64, "base64");
         const mimeType = image_mime_type ?? "image/png";
-        const ext = mimeType.split("/")[1] ?? "png";
-        const fd = new globalThis.FormData();
-        fd.append("source", new Blob([buffer], { type: mimeType }), `photo.${ext}`);
-        fd.append("message", message);
-        fd.append("published", String(published));
-        fd.append("access_token", creds.pageToken);
-        if (!published && scheduled_publish_time) {
-          const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
-          if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-          fd.append("scheduled_publish_time", String(ts));
-        }
-        const fetchRes = await fetch(
-          `https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`,
-          { method: "POST", body: fd }
+        const resData = await uploadPhotoToFacebook(
+          creds.apiVersion, creds.pageId, creds.pageToken,
+          buffer, mimeType, message, published, scheduledTs
         );
-        if (!fetchRes.ok) {
-          const errBody = await fetchRes.text();
-          throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
-        }
-        const resData = await fetchRes.json() as { id: string; post_id?: string };
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (base64 kep)" : "Utemezve (base64 kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
       }
+
       if (image_path) {
-        if (!existsSync(image_path)) throw new Error(`A fajl nem talalhato: ${image_path}`);
+        if (!existsSync(image_path)) throw new Error("A fajl nem talalhato: " + image_path);
         const fileBuffer = readFileSync(image_path);
         const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
         const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
-        const fd = new globalThis.FormData();
-        fd.append("source", new Blob([fileBuffer], { type: mimeType }), `photo.${ext}`);
-        fd.append("message", message);
-        fd.append("published", String(published));
-        fd.append("access_token", creds.pageToken);
-        if (!published && scheduled_publish_time) {
-          const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
-          if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-          fd.append("scheduled_publish_time", String(ts));
-        }
-        const fetchRes = await fetch(
-          `https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`,
-          { method: "POST", body: fd }
+        const resData = await uploadPhotoToFacebook(
+          creds.apiVersion, creds.pageId, creds.pageToken,
+          fileBuffer, mimeType, message, published, scheduledTs
         );
-        if (!fetchRes.ok) {
-          const errBody = await fetchRes.text();
-          throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
-        }
-        const resData = await fetchRes.json() as { id: string; post_id?: string };
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
       }
+
       if (image_url) {
         const photoParams: Record<string, unknown> = { message, url: image_url, published };
-        if (!published && scheduled_publish_time) {
-          const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
-          if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-          photoParams.scheduled_publish_time = ts;
-        }
-        const { data } = await client.post<{ id: string; post_id?: string }>(`/${creds.pageId}/photos`, photoParams);
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (URL-kep)" : "Utemezve (URL-kep)", photo_id: data.id, post_id: data.post_id ?? null }, null, 2) }] };
+        if (scheduledTs !== undefined) photoParams.scheduled_publish_time = scheduledTs;
+        const { data } = await client.post<{ id: string; post_id?: string }>("/" + creds.pageId + "/photos", photoParams);
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (URL-kep)" : "Utemezve (URL-kep)", photo_id: data.id, post_id: data.post_id ?? null }, null, 2) }] };
       }
+
       const params: Record<string, unknown> = { message, published, privacy: JSON.stringify({ value: privacy ?? "EVERYONE" }) };
       if (link) params.link = link;
-      if (!published && scheduled_publish_time) {
-        const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
-        if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-        params.scheduled_publish_time = ts;
-      }
-      const { data } = await client.post<{ id: string }>(`/${creds.pageId}/feed`, params);
-      return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve" : "Utemezve", post_id: data.id }, null, 2) }] };
+      if (scheduledTs !== undefined) params.scheduled_publish_time = scheduledTs;
+      const { data } = await client.post<{ id: string }>("/" + creds.pageId + "/feed", params);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve" : "Utemezve", post_id: data.id }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -221,10 +219,10 @@ function createMcpServer(creds: Credentials): McpServer {
     assertCredentials(creds);
     const client = createClient(creds);
     try {
-      const { data } = await client.post<{ success: boolean }>(`/${post_id}`, { message });
+      const { data } = await client.post<{ success: boolean }>("/" + post_id, { message });
       return { content: [{ type: "text", text: JSON.stringify({ success: data.success, post_id }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -234,10 +232,10 @@ function createMcpServer(creds: Credentials): McpServer {
     assertCredentials(creds);
     const client = createClient(creds);
     try {
-      const { data } = await client.delete<{ success: boolean }>(`/${post_id}`);
+      const { data } = await client.delete<{ success: boolean }>("/" + post_id);
       return { content: [{ type: "text", text: JSON.stringify({ success: data.success, deleted_post_id: post_id }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -247,10 +245,10 @@ function createMcpServer(creds: Credentials): McpServer {
     assertCredentials(creds);
     const client = createClient(creds);
     try {
-      const { data } = await client.post<{ success: boolean }>(`/${post_id}`, { is_published: true });
+      const { data } = await client.post<{ success: boolean }>("/" + post_id, { is_published: true });
       return { content: [{ type: "text", text: JSON.stringify({ success: data.success, published_post_id: post_id }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -259,10 +257,10 @@ function createMcpServer(creds: Credentials): McpServer {
     const client = createClient(creds);
     try {
       const fields = "id,name,category,fan_count,followers_count,about,website,phone,email,link";
-      const { data } = await client.get(`/${creds.pageId}`, { params: { fields } });
+      const { data } = await client.get("/" + creds.pageId, { params: { fields } });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -271,11 +269,11 @@ function createMcpServer(creds: Credentials): McpServer {
       return { content: [{ type: "text", text: "FB_APP_ID es FB_APP_SECRET szukseges." }], isError: true };
     const client = createClient(creds);
     try {
-      const appToken = `${creds.appId}|${creds.appSecret}`;
+      const appToken = creds.appId + "|" + creds.appSecret;
       const { data } = await client.get("/debug_token", { params: { input_token: creds.pageToken, access_token: appToken } });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -287,8 +285,8 @@ function createMcpServer(creds: Credentials): McpServer {
     try {
       const metrics = ["post_impressions","post_impressions_unique","post_engaged_users","post_clicks","post_reactions_by_type_total"].join(",");
       const [insightsRes, postRes] = await Promise.all([
-        client.get(`/${post_id}/insights`, { params: { metric: metrics } }),
-        client.get(`/${post_id}`, { params: { fields: "reactions.summary(true),likes.summary(true),comments.summary(true),shares,message,created_time" } }),
+        client.get("/" + post_id + "/insights", { params: { metric: metrics } }),
+        client.get("/" + post_id, { params: { fields: "reactions.summary(true),likes.summary(true),comments.summary(true),shares,message,created_time" } }),
       ]);
       const insightsMap: Record<string, unknown> = {};
       for (const item of insightsRes.data.data ?? []) insightsMap[item.name] = item.values?.[0]?.value ?? item.values;
@@ -301,7 +299,7 @@ function createMcpServer(creds: Credentials): McpServer {
         insights: insightsMap,
       }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -318,8 +316,8 @@ function createMcpServer(creds: Credentials): McpServer {
       if (since) params.since = Math.floor(new Date(since).getTime() / 1000);
       if (until) params.until = Math.floor(new Date(until).getTime() / 1000);
       const [insightsRes, pageRes] = await Promise.all([
-        client.get(`/${creds.pageId}/insights`, { params }),
-        client.get(`/${creds.pageId}`, { params: { fields: "fan_count,followers_count,name" } }),
+        client.get("/" + creds.pageId + "/insights", { params }),
+        client.get("/" + creds.pageId, { params: { fields: "fan_count,followers_count,name" } }),
       ]);
       const insightsMap: Record<string, unknown> = {};
       for (const item of insightsRes.data.data ?? []) insightsMap[item.name] = item.values ?? item.value;
@@ -329,7 +327,7 @@ function createMcpServer(creds: Credentials): McpServer {
         period, insights: insightsMap,
       }, null, 2) }] };
     } catch (err) {
-      return { content: [{ type: "text", text: `Hiba: ${extractError(err)}` }], isError: true };
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
     }
   });
 
@@ -384,4 +382,9 @@ app.delete("/mcp", requireApiKey, async (_req: Request, res: Response) => {
 
 if (!process.env.VERCEL) {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Meta Marketing Agent fut: ht
+    console.log("Meta Marketing Agent fut: http://0.0.0.0:" + PORT + "/mcp");
+    console.log("API key: " + (SERVER_API_KEY ? "BE" : "KI"));
+  });
+}
+
+export default app;
