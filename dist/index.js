@@ -2,6 +2,7 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import axios from "axios";
+import FormData from "form-data";
 import { z } from "zod";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
@@ -49,7 +50,7 @@ function assertCredentials(creds) {
         throw new Error(`Hianyzo hitelesito adatok: ${missing.join(", ")}`);
 }
 function createMcpServer(creds) {
-    const server = new McpServer({ name: "meta-marketing-agent", version: "2.1.0" });
+    const server = new McpServer({ name: "meta-marketing-agent", version: "2.2.0" });
     server.tool("list_posts", "Visszaadja az oldal legutóbbi bejegyzéseit.", {
         limit: z.number().int().min(1).max(100).optional().default(10),
         include_scheduled: z.boolean().optional().default(false),
@@ -114,17 +115,17 @@ function createMcpServer(creds) {
                 const mimeType = image_mime_type ?? "image/png";
                 const ext = mimeType.split("/")[1] ?? "png";
                 const formData = new FormData();
+                formData.append("source", buffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: buffer.length });
                 formData.append("message", message);
                 formData.append("published", String(published));
                 formData.append("access_token", creds.pageToken);
-                formData.append("source", new Blob([buffer], { type: mimeType }), `photo.${ext}`);
                 if (!published && scheduled_publish_time) {
                     const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
                     if (isNaN(ts))
                         throw new Error("Ervenytelen scheduled_publish_time formatum.");
                     formData.append("scheduled_publish_time", String(ts));
                 }
-                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData);
+                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData, { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity });
                 return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
             }
             if (image_path) {
@@ -134,17 +135,17 @@ function createMcpServer(creds) {
                 const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
                 const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
                 const formData = new FormData();
+                formData.append("source", fileBuffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: fileBuffer.length });
                 formData.append("message", message);
                 formData.append("published", String(published));
                 formData.append("access_token", creds.pageToken);
-                formData.append("source", new Blob([fileBuffer], { type: mimeType }), `photo.${ext}`);
                 if (!published && scheduled_publish_time) {
                     const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
                     if (isNaN(ts))
                         throw new Error("Ervenytelen scheduled_publish_time formatum.");
                     formData.append("scheduled_publish_time", String(ts));
                 }
-                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData);
+                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData, { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity });
                 return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
             }
             if (image_url) {
@@ -327,7 +328,7 @@ function requireApiKey(req, res, next) {
     next();
 }
 app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "meta-marketing-agent", version: "2.1.0" });
+    res.json({ status: "ok", service: "meta-marketing-agent", version: "2.2.0" });
 });
 app.post("/mcp", requireApiKey, async (req, res) => {
     const creds = getCredentials(req);
