@@ -415,11 +415,9 @@ app.delete("/mcp", requireApiKey, async (_req: Request, res: Response) => {
   res.status(405).json({ error: "Session kezeles nem tamogatott." });
 });
 
-if (!process.env.VERCEL) {
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log("Meta Marketing Agent fut: http://0.0.0.0:" + PORT + "/mcp");
-    console.log("API key: " + (SERVER_API_KEY ? "BE" : "KI"));
-  });
-}
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Meta Marketing Agent v2.3.0 fut: http://0.0.0.0:" + PORT + "/mcp");
+  console.log("API key: " + (SERVER_API_KEY ? "BE" : "KI"));
+});
 
 export default app;
