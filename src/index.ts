@@ -343,7 +343,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", [
     "Content-Type","Accept","Mcp-Session-Id","MCP-Protocol-Version",
     "x-api-key","x-fb-page-access-token","x-fb-page-id","x-fb-app-id","x-fb-app-secret","x-fb-api-version",
-    "x-message","x-published","x-scheduled-time",
+    "x-message","x-message-b64","x-published","x-scheduled-time",
   ].join(", "));
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
@@ -373,7 +373,11 @@ app.post("/upload-image", requireApiKey, express.raw({ type: ["image/*", "applic
       return;
     }
     const mimeType = ((req.headers["content-type"] as string) ?? "image/jpeg").split(";")[0].trim();
-    const message = (req.headers["x-message"] as string) ?? "";
+    // x-message-b64 allows multiline/emoji messages (base64-encoded)
+    const msgB64 = req.headers["x-message-b64"] as string;
+    const message = msgB64
+      ? Buffer.from(msgB64, "base64").toString("utf-8")
+      : (req.headers["x-message"] as string) ?? "";
     const published = (req.headers["x-published"] as string) !== "false";
     let scheduledTs: number | undefined;
     const scheduledTime = req.headers["x-scheduled-time"] as string;
