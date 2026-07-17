@@ -1,15 +1,19 @@
-import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import axios from "axios";
-import FormData from "form-data";
-import { z } from "zod";
-import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import { dirname, join, extname } from "path";
-import { readFileSync, existsSync } from "fs";
-const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: join(__dirname, "..", ".env") });
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = __importDefault(require("express"));
+const mcp_js_1 = require("@modelcontextprotocol/sdk/server/mcp.js");
+const streamableHttp_js_1 = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const axios_1 = __importDefault(require("axios"));
+const zod_1 = require("zod");
+const dotenv_1 = __importDefault(require("dotenv"));
+const url_1 = require("url");
+const path_1 = require("path");
+const fs_1 = require("fs");
+const __dirname = (0, path_1.dirname)((0, url_1.fileURLToPath)(import.meta.url));
+dotenv_1.default.config({ path: (0, path_1.join)(__dirname, "..", ".env") });
 const SERVER_API_KEY = process.env.API_KEY ?? "";
 const PORT = parseInt(process.env.PORT ?? "3000");
 const DEFAULT_API_VERSION = process.env.FB_API_VERSION ?? "v21.0";
@@ -27,14 +31,14 @@ function getCredentials(req) {
     };
 }
 function extractError(err) {
-    if (axios.isAxiosError(err) && err.response?.data?.error) {
+    if (axios_1.default.isAxiosError(err) && err.response?.data?.error) {
         const e = err.response.data.error;
         return `Facebook API hiba (${e.code}): ${e.message}`;
     }
     return err instanceof Error ? err.message : String(err);
 }
 function createClient(creds) {
-    return axios.create({
+    return axios_1.default.create({
         baseURL: `https://graph.facebook.com/${creds.apiVersion}`,
         params: { access_token: creds.pageToken },
         timeout: 15000,
@@ -50,10 +54,10 @@ function assertCredentials(creds) {
         throw new Error(`Hianyzo hitelesito adatok: ${missing.join(", ")}`);
 }
 function createMcpServer(creds) {
-    const server = new McpServer({ name: "meta-marketing-agent", version: "2.2.0" });
+    const server = new mcp_js_1.McpServer({ name: "meta-marketing-agent", version: "2.2.0" });
     server.tool("list_posts", "Visszaadja az oldal legutóbbi bejegyzéseit.", {
-        limit: z.number().int().min(1).max(100).optional().default(10),
-        include_scheduled: z.boolean().optional().default(false),
+        limit: zod_1.z.number().int().min(1).max(100).optional().default(10),
+        include_scheduled: zod_1.z.boolean().optional().default(false),
     }, async ({ limit, include_scheduled }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -83,7 +87,7 @@ function createMcpServer(creds) {
         }
     });
     server.tool("get_post", "Egy adott Facebook bejegyzes reszleteit adja vissza.", {
-        post_id: z.string().min(1),
+        post_id: zod_1.z.string().min(1),
     }, async ({ post_id }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -97,15 +101,15 @@ function createMcpServer(creds) {
         }
     });
     server.tool("create_post", "Uj bejegyzest tesz kozzé az oldalon képpel vagy anelkul, vagy utemezi. A kep megadhato base64 kodolt stringkent (image_base64), nyilvanos URL-kent (image_url), vagy link-kent.", {
-        message: z.string().min(1).max(63206),
-        image_base64: z.string().optional(),
-        image_mime_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]).optional().default("image/png"),
-        image_url: z.string().url().optional(),
-        image_path: z.string().optional(),
-        link: z.string().url().optional(),
-        published: z.boolean().optional().default(true),
-        scheduled_publish_time: z.string().optional(),
-        privacy: z.enum(["EVERYONE", "FRIENDS", "ONLY_ME"]).optional().default("EVERYONE"),
+        message: zod_1.z.string().min(1).max(63206),
+        image_base64: zod_1.z.string().optional(),
+        image_mime_type: zod_1.z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]).optional().default("image/png"),
+        image_url: zod_1.z.string().url().optional(),
+        image_path: zod_1.z.string().optional(),
+        link: zod_1.z.string().url().optional(),
+        published: zod_1.z.boolean().optional().default(true),
+        scheduled_publish_time: zod_1.z.string().optional(),
+        privacy: zod_1.z.enum(["EVERYONE", "FRIENDS", "ONLY_ME"]).optional().default("EVERYONE"),
     }, async ({ message, image_base64, image_mime_type, image_url, image_path, link, published, scheduled_publish_time, privacy }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -114,39 +118,49 @@ function createMcpServer(creds) {
                 const buffer = Buffer.from(image_base64, "base64");
                 const mimeType = image_mime_type ?? "image/png";
                 const ext = mimeType.split("/")[1] ?? "png";
-                const formData = new FormData();
-                formData.append("source", buffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: buffer.length });
-                formData.append("message", message);
-                formData.append("published", String(published));
-                formData.append("access_token", creds.pageToken);
+                const fd = new globalThis.FormData();
+                fd.append("source", new Blob([buffer], { type: mimeType }), `photo.${ext}`);
+                fd.append("message", message);
+                fd.append("published", String(published));
+                fd.append("access_token", creds.pageToken);
                 if (!published && scheduled_publish_time) {
                     const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
                     if (isNaN(ts))
                         throw new Error("Ervenytelen scheduled_publish_time formatum.");
-                    formData.append("scheduled_publish_time", String(ts));
+                    fd.append("scheduled_publish_time", String(ts));
                 }
-                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData, { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity });
-                return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
+                const fetchRes = await fetch(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, { method: "POST", body: fd });
+                if (!fetchRes.ok) {
+                    const errBody = await fetchRes.text();
+                    throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
+                }
+                const resData = await fetchRes.json();
+                return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
             }
             if (image_path) {
-                if (!existsSync(image_path))
+                if (!(0, fs_1.existsSync)(image_path))
                     throw new Error(`A fajl nem talalhato: ${image_path}`);
-                const fileBuffer = readFileSync(image_path);
-                const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
+                const fileBuffer = (0, fs_1.readFileSync)(image_path);
+                const ext = (0, path_1.extname)(image_path).toLowerCase().replace(".", "") || "jpeg";
                 const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
-                const formData = new FormData();
-                formData.append("source", fileBuffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: fileBuffer.length });
-                formData.append("message", message);
-                formData.append("published", String(published));
-                formData.append("access_token", creds.pageToken);
+                const fd = new globalThis.FormData();
+                fd.append("source", new Blob([fileBuffer], { type: mimeType }), `photo.${ext}`);
+                fd.append("message", message);
+                fd.append("published", String(published));
+                fd.append("access_token", creds.pageToken);
                 if (!published && scheduled_publish_time) {
                     const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
                     if (isNaN(ts))
                         throw new Error("Ervenytelen scheduled_publish_time formatum.");
-                    formData.append("scheduled_publish_time", String(ts));
+                    fd.append("scheduled_publish_time", String(ts));
                 }
-                const res = await axios.post(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, formData, { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity });
-                return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
+                const fetchRes = await fetch(`https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`, { method: "POST", body: fd });
+                if (!fetchRes.ok) {
+                    const errBody = await fetchRes.text();
+                    throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
+                }
+                const resData = await fetchRes.json();
+                return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
             }
             if (image_url) {
                 const photoParams = { message, url: image_url, published };
@@ -176,8 +190,8 @@ function createMcpServer(creds) {
         }
     });
     server.tool("update_post", "Meglevo bejegyzes szoveget modositja.", {
-        post_id: z.string().min(1),
-        message: z.string().min(1).max(63206),
+        post_id: zod_1.z.string().min(1),
+        message: zod_1.z.string().min(1).max(63206),
     }, async ({ post_id, message }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -190,7 +204,7 @@ function createMcpServer(creds) {
         }
     });
     server.tool("delete_post", "Torol egy bejegyzest az oldalrol. A muvelet visszavonhatatlan.", {
-        post_id: z.string().min(1),
+        post_id: zod_1.z.string().min(1),
     }, async ({ post_id }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -203,7 +217,7 @@ function createMcpServer(creds) {
         }
     });
     server.tool("publish_scheduled_post", "Egy korabban utemezett bejegyzest azonnal kozzétesz.", {
-        post_id: z.string().min(1),
+        post_id: zod_1.z.string().min(1),
     }, async ({ post_id }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -241,7 +255,7 @@ function createMcpServer(creds) {
         }
     });
     server.tool("get_post_insights", "Visszaadja egy bejegyzes statisztikait.", {
-        post_id: z.string().min(1),
+        post_id: zod_1.z.string().min(1),
     }, async ({ post_id }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -268,9 +282,9 @@ function createMcpServer(creds) {
         }
     });
     server.tool("get_page_insights", "Visszaadja az oldal osszesitett statisztikait.", {
-        period: z.enum(["day", "week", "days_28", "month", "lifetime"]).optional().default("week"),
-        since: z.string().optional(),
-        until: z.string().optional(),
+        period: zod_1.z.enum(["day", "week", "days_28", "month", "lifetime"]).optional().default("week"),
+        since: zod_1.z.string().optional(),
+        until: zod_1.z.string().optional(),
     }, async ({ period, since, until }) => {
         assertCredentials(creds);
         const client = createClient(creds);
@@ -300,8 +314,8 @@ function createMcpServer(creds) {
     });
     return server;
 }
-const app = express();
-app.use(express.json({ limit: "20mb" }));
+const app = (0, express_1.default)();
+app.use(express_1.default.json({ limit: "20mb" }));
 app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -333,7 +347,7 @@ app.get("/health", (_req, res) => {
 app.post("/mcp", requireApiKey, async (req, res) => {
     const creds = getCredentials(req);
     const server = createMcpServer(creds);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new streamableHttp_js_1.StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close(); server.close(); });
     try {
         await server.connect(transport);
@@ -352,9 +366,7 @@ app.delete("/mcp", requireApiKey, async (_req, res) => {
 });
 if (!process.env.VERCEL) {
     app.listen(PORT, "0.0.0.0", () => {
-        console.log(`Meta Marketing Agent fut: http://0.0.0.0:${PORT}/mcp`);
-        console.log(`API key: ${SERVER_API_KEY ? "BE" : "KI"}`);
+        console.log(`Meta Marketing Agent fut: ht);
     });
 }
-export default app;
 //# sourceMappingURL=index.js.map

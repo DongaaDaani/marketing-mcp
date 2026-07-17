@@ -2,7 +2,6 @@ import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import axios, { AxiosInstance } from "axios";
-import FormData from "form-data";
 import { z } from "zod";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
@@ -144,44 +143,52 @@ function createMcpServer(creds: Credentials): McpServer {
         const buffer = Buffer.from(image_base64, "base64");
         const mimeType = image_mime_type ?? "image/png";
         const ext = mimeType.split("/")[1] ?? "png";
-        const formData = new FormData();
-        formData.append("source", buffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: buffer.length });
-        formData.append("message", message);
-        formData.append("published", String(published));
-        formData.append("access_token", creds.pageToken);
+        const fd = new globalThis.FormData();
+        fd.append("source", new Blob([buffer], { type: mimeType }), `photo.${ext}`);
+        fd.append("message", message);
+        fd.append("published", String(published));
+        fd.append("access_token", creds.pageToken);
         if (!published && scheduled_publish_time) {
           const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
           if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-          formData.append("scheduled_publish_time", String(ts));
+          fd.append("scheduled_publish_time", String(ts));
         }
-        const res = await axios.post<{ id: string; post_id?: string }>(
+        const fetchRes = await fetch(
           `https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`,
-          formData,
-          { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity }
+          { method: "POST", body: fd }
         );
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
+        if (!fetchRes.ok) {
+          const errBody = await fetchRes.text();
+          throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
+        }
+        const resData = await fetchRes.json() as { id: string; post_id?: string };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (base64 kep)" : "Utemezve (base64 kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
       }
       if (image_path) {
         if (!existsSync(image_path)) throw new Error(`A fajl nem talalhato: ${image_path}`);
         const fileBuffer = readFileSync(image_path);
         const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
         const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
-        const formData = new FormData();
-        formData.append("source", fileBuffer, { filename: `photo.${ext}`, contentType: mimeType, knownLength: fileBuffer.length });
-        formData.append("message", message);
-        formData.append("published", String(published));
-        formData.append("access_token", creds.pageToken);
+        const fd = new globalThis.FormData();
+        fd.append("source", new Blob([fileBuffer], { type: mimeType }), `photo.${ext}`);
+        fd.append("message", message);
+        fd.append("published", String(published));
+        fd.append("access_token", creds.pageToken);
         if (!published && scheduled_publish_time) {
           const ts = Math.floor(new Date(scheduled_publish_time).getTime() / 1000);
           if (isNaN(ts)) throw new Error("Ervenytelen scheduled_publish_time formatum.");
-          formData.append("scheduled_publish_time", String(ts));
+          fd.append("scheduled_publish_time", String(ts));
         }
-        const res = await axios.post<{ id: string; post_id?: string }>(
+        const fetchRes = await fetch(
           `https://graph.facebook.com/${creds.apiVersion}/${creds.pageId}/photos`,
-          formData,
-          { headers: formData.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity }
+          { method: "POST", body: fd }
         );
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: res.data.id, post_id: res.data.post_id ?? null }, null, 2) }] };
+        if (!fetchRes.ok) {
+          const errBody = await fetchRes.text();
+          throw new Error(`Facebook API hiba (${fetchRes.status}): ${errBody}`);
+        }
+        const resData = await fetchRes.json() as { id: string; post_id?: string };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzétéve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
       }
       if (image_url) {
         const photoParams: Record<string, unknown> = { message, url: image_url, published };
@@ -377,9 +384,4 @@ app.delete("/mcp", requireApiKey, async (_req: Request, res: Response) => {
 
 if (!process.env.VERCEL) {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Meta Marketing Agent fut: http://0.0.0.0:${PORT}/mcp`);
-    console.log(`API key: ${SERVER_API_KEY ? "BE" : "KI"}`);
-  });
-}
-
-export default app;
+    console.log(`Meta Marketing Agent fut: ht
