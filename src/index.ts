@@ -1,6 +1,8 @@
 import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { randomUUID } from "crypto";
 import axios, { AxiosInstance } from "axios";
 import { z } from "zod";
 import dotenv from "dotenv";
@@ -18,6 +20,38 @@ const DEFAULT_PAGE_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN ?? "";
 const DEFAULT_PAGE_ID = process.env.FB_PAGE_ID ?? "";
 const DEFAULT_APP_ID = process.env.FB_APP_ID ?? "";
 const DEFAULT_APP_SECRET = process.env.FB_APP_SECRET ?? "";
+
+// DO Spaces (S3-compatible CDN storage)
+const SPACES_KEY    = process.env.DO_SPACES_KEY ?? "";
+const SPACES_SECRET = process.env.DO_SPACES_SECRET ?? "";
+const SPACES_BUCKET = process.env.DO_SPACES_BUCKET ?? "allinhoreca-media";
+const SPACES_REGION = process.env.DO_SPACES_REGION ?? "ams3";
+const SPACES_ENDPOINT = `https://${SPACES_REGION}.digitaloceanspaces.com`;
+const SPACES_CDN    = process.env.DO_SPACES_CDN ?? `https://${SPACES_BUCKET}.${SPACES_REGION}.cdn.digitaloceanspaces.com`;
+
+let s3Client: S3Client | null = null;
+if (SPACES_KEY && SPACES_SECRET) {
+  s3Client = new S3Client({
+    endpoint: SPACES_ENDPOINT,
+    region: SPACES_REGION,
+    credentials: { accessKeyId: SPACES_KEY, secretAccessKey: SPACES_SECRET },
+    forcePathStyle: false,
+  });
+}
+
+async function uploadToSpaces(buffer: Buffer, mimeType: string): Promise<string> {
+  if (!s3Client) throw new Error("DO Spaces nincs konfigurálva. Állítsd be: DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_BUCKET, DO_SPACES_REGION");
+  const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") ?? "jpg";
+  const key = `uploads/${randomUUID()}.${ext}`;
+  await s3Client.send(new PutObjectCommand({
+    Bucket: SPACES_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: mimeType,
+    ACL: "public-read",
+  }));
+  return `${SPACES_CDN}/${key}`;
+}
 
 interface Credentials {
   pageToken: string;
@@ -303,6 +337,19 @@ function createMcpServer(creds: Credentials): McpServer {
     }
   });
 
+  server.tool("upload_image", "Kepet tolt fel a DO Spaces CDN-re es visszaadja a nyilvanos URL-t. Ezt hasznald create_post elott ha helyi kepet szeretnel posztolni image_url-ken keresztul. A base64 csak a SZOVEGET kodold, a KEPET ne!", {
+    image_base64: z.string().min(1),
+    image_mime_type: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]).optional().default("image/jpeg"),
+  }, async ({ image_base64, image_mime_type }) => {
+    try {
+      const buffer = Buffer.from(image_base64, "base64");
+      const url = await uploadToSpaces(buffer, image_mime_type ?? "image/jpeg");
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, url, tip: "Hasznald ezt: create_post(image_url='" + url + "')" }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: "Hiba: " + extractError(err) }], isError: true };
+    }
+  });
+
   server.tool("get_page_insights", "Visszaadja az oldal osszesitett statisztikait.", {
     period: z.enum(["day","week","days_28","month","lifetime"]).optional().default("week"),
     since: z.string().optional(),
@@ -343,7 +390,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", [
     "Content-Type","Accept","Mcp-Session-Id","MCP-Protocol-Version",
     "x-api-key","x-fb-page-access-token","x-fb-page-id","x-fb-app-id","x-fb-app-secret","x-fb-api-version",
-    "x-message","x-message-b64","x-published","x-scheduled-time",
+    "x-message","x-published","x-scheduled-time",
   ].join(", "));
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
@@ -373,7 +420,8 @@ app.post("/upload-image", requireApiKey, express.raw({ type: ["image/*", "applic
       return;
     }
     const mimeType = ((req.headers["content-type"] as string) ?? "image/jpeg").split(";")[0].trim();
-    // x-message-b64 allows multiline/emoji messages (base64-encoded)
+    // x-message-b64: base64-kódolt üzenet (ékezetek + emojik biztonságos átviteléhez) — PREFERÁLT
+    // x-message: sima szöveg (visszafelé kompatibilitás)
     const msgB64 = req.headers["x-message-b64"] as string;
     const message = msgB64
       ? Buffer.from(msgB64, "base64").toString("utf-8")
@@ -398,6 +446,127 @@ app.post("/upload-image", requireApiKey, express.raw({ type: ["image/*", "applic
   }
 });
 
+// REST endpoint: POST /store-image
+// Képet fogad (raw binary), feltölti DO Spaces CDN-re, visszaad publikus URL-t.
+// Ezt használja az /upload-ui web form és a curl feltöltő szkript.
+app.post("/store-image", requireApiKey, express.raw({ type: ["image/*", "application/octet-stream"], limit: "20mb" }), async (req: Request, res: Response) => {
+  try {
+    const imageBuffer = req.body as Buffer;
+    if (!imageBuffer || imageBuffer.length === 0) {
+      res.status(400).json({ success: false, error: "Nincs képfájl a request body-ban." });
+      return;
+    }
+    const mimeType = ((req.headers["content-type"] as string) ?? "image/jpeg").split(";")[0].trim();
+    const url = await uploadToSpaces(imageBuffer, mimeType);
+    res.json({ success: true, url, tip: "Használd ezt: create_post(image_url='" + url + "')" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: extractError(err) });
+  }
+});
+
+// Web UI: GET /upload-ui?k={api_key}
+// Drag-drop képfeltöltő oldal böngészőből — visszaad CDN URL-t amit Claude-nak adhatsz
+app.get("/upload-ui", (_req: Request, res: Response) => {
+  const apiKey = SERVER_API_KEY;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kép feltöltő – Allinhoreca Media</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Arial,sans-serif;background:#faf7f4;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#fff;border-radius:12px;padding:36px;max-width:540px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,.08)}
+  h1{color:#B84C00;font-size:22px;margin-bottom:8px}
+  p{color:#666;font-size:14px;margin-bottom:24px}
+  .dz{border:3px dashed #ddd;border-radius:10px;padding:48px 24px;text-align:center;cursor:pointer;transition:all .2s;background:#fdfaf8}
+  .dz:hover,.dz.over{border-color:#B84C00;background:#fff5f0}
+  .dz .icon{font-size:48px;margin-bottom:12px}
+  .dz .label{color:#999;font-size:15px}
+  input[type=file]{display:none}
+  .progress{display:none;margin-top:20px;background:#f0f0f0;border-radius:6px;height:8px;overflow:hidden}
+  .progress-bar{height:100%;background:#B84C00;width:0;transition:width .3s}
+  .result{display:none;margin-top:20px;background:#f0fff0;border:1px solid #b2dfdb;border-radius:8px;padding:16px}
+  .result .url{word-break:break-all;font-size:13px;color:#333;margin:8px 0 14px}
+  .copy-btn{background:#B84C00;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px;width:100%}
+  .copy-btn:hover{background:#963d00}
+  .error{display:none;margin-top:20px;background:#fff0f0;border:1px solid #ffcdd2;border-radius:8px;padding:16px;color:#c62828;font-size:14px}
+  .copied{background:#388e3c!important}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📷 Allinhoreca Kép Feltöltő</h1>
+  <p>Húzd ide a képet vagy kattints. A kép feltöltődik a CDN-re, majd visszakapsz egy URL-t amit Claude-nak adhatsz.</p>
+  <div class="dz" id="dz">
+    <div class="icon">🖼️</div>
+    <div class="label">Húzd ide vagy kattints a kiválasztáshoz</div>
+    <input type="file" id="fi" accept="image/*">
+  </div>
+  <div class="progress" id="prog"><div class="progress-bar" id="bar"></div></div>
+  <div class="result" id="res">
+    <b>✅ Feltöltve! Másold be ezt az URL-t Claude-nak:</b>
+    <div class="url" id="url"></div>
+    <button class="copy-btn" id="copy-btn">📋 URL Másolása</button>
+  </div>
+  <div class="error" id="err"></div>
+</div>
+<script>
+const dz=document.getElementById('dz'),fi=document.getElementById('fi');
+const prog=document.getElementById('prog'),bar=document.getElementById('bar');
+const res=document.getElementById('res'),urlEl=document.getElementById('url');
+const errEl=document.getElementById('err'),copyBtn=document.getElementById('copy-btn');
+let lastUrl='';
+
+async function upload(file){
+  errEl.style.display='none'; res.style.display='none';
+  prog.style.display='block'; bar.style.width='20%';
+  try{
+    bar.style.width='60%';
+    const buf=await file.arrayBuffer();
+    bar.style.width='80%';
+    const resp=await fetch('/store-image',{
+      method:'POST',
+      headers:{'Content-Type':file.type,'x-api-key':'${apiKey}'},
+      body:buf
+    });
+    const data=await resp.json();
+    bar.style.width='100%';
+    setTimeout(()=>{prog.style.display='none';},400);
+    if(data.url){
+      lastUrl=data.url;
+      urlEl.textContent=data.url;
+      res.style.display='block';
+    } else {
+      errEl.textContent='Hiba: '+(data.error||'ismeretlen hiba');
+      errEl.style.display='block';
+    }
+  } catch(e){
+    prog.style.display='none';
+    errEl.textContent='Hálózati hiba: '+e.message;
+    errEl.style.display='block';
+  }
+}
+
+fi.onchange=e=>e.target.files[0]&&upload(e.target.files[0]);
+dz.onclick=()=>fi.click();
+dz.ondragover=e=>{e.preventDefault();dz.classList.add('over')};
+dz.ondragleave=()=>dz.classList.remove('over');
+dz.ondrop=e=>{e.preventDefault();dz.classList.remove('over');e.dataTransfer.files[0]&&upload(e.dataTransfer.files[0])};
+copyBtn.onclick=()=>{
+  navigator.clipboard.writeText(lastUrl).then(()=>{
+    copyBtn.textContent='✅ Másolva!';
+    copyBtn.classList.add('copied');
+    setTimeout(()=>{copyBtn.textContent='📋 URL Másolása';copyBtn.classList.remove('copied');},2000);
+  });
+};
+</script>
+</body>
+</html>`);
+});
+
 app.post("/mcp", requireApiKey, async (req: Request, res: Response) => {
   const creds = getCredentials(req);
   const server = createMcpServer(creds);
@@ -419,9 +588,11 @@ app.delete("/mcp", requireApiKey, async (_req: Request, res: Response) => {
   res.status(405).json({ error: "Session kezeles nem tamogatott." });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Meta Marketing Agent v2.3.0 fut: http://0.0.0.0:" + PORT + "/mcp");
-  console.log("API key: " + (SERVER_API_KEY ? "BE" : "KI"));
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log("Meta Marketing Agent fut: http://0.0.0.0:" + PORT + "/mcp");
+    console.log("API key: " + (SERVER_API_KEY ? "BE" : "KI"));
+  });
+}
 
 export default app;
