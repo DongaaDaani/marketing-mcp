@@ -18,6 +18,37 @@ const PORT = parseInt(process.env.PORT ?? "3000");
 const DEFAULT_API_VERSION = process.env.FB_API_VERSION ?? "v21.0";
 const DEFAULT_PAGE_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN ?? "";
 const DEFAULT_PAGE_ID = process.env.FB_PAGE_ID ?? "";
+
+// ---------------------------------------------------------------------------
+// SZERVEROLDALI OLDAL-NYILVANTARTAS
+//
+// Minden Facebook oldal hitelesito adata a szerver kornyezeti valtozoiban van,
+// nem a kliens headereiben. Az oldalt az URL ?p= parametere valasztja ki:
+//   /mcp?p=hu  ->  FB_PAGE_TOKEN_HU + FB_PAGE_ID_HU
+//   /mcp?p=de  ->  FB_PAGE_TOKEN_DE + FB_PAGE_ID_DE
+//
+// Igy a plugin .mcp.json fajlba nem kell titkot tenni, es a mukodes nem fugg
+// attol, hogy a kliens tovabbitja-e a custom headereket.
+// ---------------------------------------------------------------------------
+const PAGE_KEYS = ["hu", "de", "at", "fr", "it", "ro", "es"] as const;
+type PageKey = (typeof PAGE_KEYS)[number];
+
+interface PageCreds { token: string; id: string; }
+
+const PAGE_REGISTRY: Record<string, PageCreds> = {};
+for (const k of PAGE_KEYS) {
+  const up = k.toUpperCase();
+  const token = process.env[`FB_PAGE_TOKEN_${up}`] ?? "";
+  const id = process.env[`FB_PAGE_ID_${up}`] ?? "";
+  if (token && id) PAGE_REGISTRY[k] = { token, id };
+}
+
+function resolvePage(req: Request): PageCreds | null {
+  const raw = req.query?.p;
+  const key = (Array.isArray(raw) ? raw[0] : raw);
+  if (typeof key !== "string") return null;
+  return PAGE_REGISTRY[key.toLowerCase()] ?? null;
+}
 const DEFAULT_APP_ID = process.env.FB_APP_ID ?? "";
 const DEFAULT_APP_SECRET = process.env.FB_APP_SECRET ?? "";
 
@@ -62,9 +93,13 @@ interface Credentials {
 }
 
 function getCredentials(req: Request): Credentials {
+  // Sorrend: 1) szerveroldali oldal-nyilvantartas (?p=xx)
+  //          2) kliens header (visszafele kompatibilitas)
+  //          3) egyetlen env default
+  const page = resolvePage(req);
   return {
-    pageToken: (req.headers["x-fb-page-access-token"] as string) || DEFAULT_PAGE_TOKEN,
-    pageId: (req.headers["x-fb-page-id"] as string) || DEFAULT_PAGE_ID,
+    pageToken: page?.token || (req.headers["x-fb-page-access-token"] as string) || DEFAULT_PAGE_TOKEN,
+    pageId: page?.id || (req.headers["x-fb-page-id"] as string) || DEFAULT_PAGE_ID,
     appId: (req.headers["x-fb-app-id"] as string) || DEFAULT_APP_ID,
     appSecret: (req.headers["x-fb-app-secret"] as string) || DEFAULT_APP_SECRET,
     apiVersion: (req.headers["x-fb-api-version"] as string) || DEFAULT_API_VERSION,
@@ -140,7 +175,7 @@ async function uploadPhotoToFacebook(
 }
 
 function createMcpServer(creds: Credentials): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "2.3.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "2.5.0" });
 
   server.tool("list_posts", "Visszaadja az oldal legutobb bejegyzeseit.", {
     limit: z.number().int().min(1).max(100).optional().default(10),
@@ -290,7 +325,7 @@ function createMcpServer(creds: Credentials): McpServer {
     assertCredentials(creds);
     const client = createClient(creds);
     try {
-      const fields = "id,name,category,fan_count,followers_count,about,website,phone,email,link";
+      const fields = "id,name,category,fan_count,followers_count,about,website,link";
       const { data } = await client.get("/" + creds.pageId, { params: { fields } });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     } catch (err) {
@@ -403,8 +438,58 @@ function requireApiKey(req: Request, res: Response, next: () => void): void {
   next();
 }
 
+// MCP-specifikus hitelesites.
+// KRITIKUS: a /mcp vegpont SOHA nem adhat 401-et. Az MCP spec szerint a 401 azt
+// jelenti "OAuth hitelesites kell", amire a kliens (Cowork / Claude Desktop) OAuth
+// discovery + Dynamic Client Registration folyamatot indit. Mivel ez a szerver
+// statikus API kulcsot hasznal, a regisztracio elbukik es a connector nem tud
+// csatlakozni: "Couldn't register with facebook-XX's sign-in service".
+//
+// Ezert a kezfogas (initialize, tools/list, ping) kulcs nelkul is atmegy — ez csak
+// a tool-semakat adja vissza, adatot nem. A tenyleges muveletek (tools/call) viszont
+// kulcsot igenyelnek, es hiba eseten JSON-RPC hibat adunk HTTP 200-ban, nem 401-et.
+const OPEN_MCP_METHODS = new Set([
+  "initialize",
+  "ping",
+  "tools/list",
+  "resources/list",
+  "prompts/list",
+  "resources/templates/list",
+]);
+
+function requireApiKeyMcp(req: Request, res: Response, next: () => void): void {
+  if (!SERVER_API_KEY) { next(); return; }
+
+  const body = req.body as { method?: string; id?: unknown } | undefined;
+  const method = body?.method ?? "";
+
+  if (OPEN_MCP_METHODS.has(method) || method.startsWith("notifications/")) {
+    next();
+    return;
+  }
+
+  const key = req.headers["x-api-key"] as string;
+  if (key !== SERVER_API_KEY) {
+    res.status(200).json({
+      jsonrpc: "2.0",
+      id: body?.id ?? null,
+      error: { code: -32001, message: "Ervenytelen vagy hianyzo API kulcs (x-api-key)." },
+    });
+    return;
+  }
+  next();
+}
+
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "meta-marketing-agent", version: "2.3.0" });
+  res.json({
+    status: "ok",
+    service: "meta-marketing-agent",
+    version: "2.5.0",
+    // Csak a beallitott oldalak KULCSAI es page ID-jai — token soha nem kerul ki
+    configured_pages: Object.fromEntries(
+      Object.entries(PAGE_REGISTRY).map(([k, v]) => [k, v.id])
+    ),
+  });
 });
 
 // REST endpoint: POST /upload-image
@@ -567,7 +652,7 @@ copyBtn.onclick=()=>{
 </html>`);
 });
 
-app.post("/mcp", requireApiKey, async (req: Request, res: Response) => {
+app.post("/mcp", requireApiKeyMcp, async (req: Request, res: Response) => {
   const creds = getCredentials(req);
   const server = createMcpServer(creds);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -580,11 +665,11 @@ app.post("/mcp", requireApiKey, async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", requireApiKey, async (_req: Request, res: Response) => {
+app.get("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({ error: "A szerver stateless modban fut, GET nem tamogatott." });
 });
 
-app.delete("/mcp", requireApiKey, async (_req: Request, res: Response) => {
+app.delete("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({ error: "Session kezeles nem tamogatott." });
 });
 
