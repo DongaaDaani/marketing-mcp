@@ -140,10 +140,15 @@ function createClient(creds: Credentials): AxiosInstance {
 }
 
 function assertCredentials(creds: Credentials): void {
-  const missing: string[] = [];
-  if (!creds.pageToken) missing.push("FB_PAGE_ACCESS_TOKEN (x-fb-page-access-token header)");
-  if (!creds.pageId) missing.push("FB_PAGE_ID (x-fb-page-id header)");
-  if (missing.length) throw new Error("Hianyzo hitelesito adatok: " + missing.join(", "));
+  if (creds.pageToken && creds.pageId) return;
+  const avail = Object.keys(PAGE_REGISTRY);
+  if (avail.length) {
+    throw new Error(
+      "Nincs megadva melyik oldalra szol a muvelet. Add meg a 'page' parametert. " +
+      "Elerheto oldalak: " + avail.join(", ")
+    );
+  }
+  throw new Error("A szerveren egyetlen oldal sincs beallitva (FB_PAGE_TOKEN_XX / FB_PAGE_ID_XX).");
 }
 
 async function uploadPhotoToFacebook(
@@ -174,13 +179,42 @@ async function uploadPhotoToFacebook(
   return fetchRes.json() as Promise<{ id: string; post_id?: string }>;
 }
 
-function createMcpServer(creds: Credentials): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "2.5.0" });
+// Az oldalvalaszto parameter semaja — MINDEN tool megkapja.
+// Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
+// amibol a kliensnel gyakran csak nehany epult fel.
+const pageParam = z
+  .enum(PAGE_KEYS)
+  .optional()
+  .describe(
+    "Melyik Facebook oldal: hu (Allinhoreca Magyar), de (Deutschland), at (Osterreich), " +
+    "fr (France), it (Italia), ro (Romania), es (Espana & Portugal). " +
+    "Kotelezo megadni, kiveve ha az URL ?p= parametere mar meghatarozza."
+  );
+
+function createMcpServer(req: Request): McpServer {
+  const server = new McpServer({ name: "meta-marketing-agent", version: "3.0.0" });
+
+  // Oldalankenti hitelesites feloldasa: elsodleges a tool 'page' parametere,
+  // masodlagos az URL ?p= parametere, vegul a header / env default.
+  const credsFor = (page?: string): Credentials => {
+    const base = getCredentials(req);
+    if (page) {
+      const pc = PAGE_REGISTRY[page.toLowerCase()];
+      if (!pc) {
+        const avail = Object.keys(PAGE_REGISTRY).join(", ") || "(egy sincs beallitva)";
+        throw new Error(`Ismeretlen oldal: '${page}'. Elerheto oldalak: ${avail}`);
+      }
+      return { ...base, pageToken: pc.token, pageId: pc.id };
+    }
+    return base;
+  };
 
   server.tool("list_posts", "Visszaadja az oldal legutobb bejegyzeseit.", {
+    page: pageParam,
     limit: z.number().int().min(1).max(100).optional().default(10),
     include_scheduled: z.boolean().optional().default(false),
-  }, async ({ limit, include_scheduled }) => {
+  }, async ({ page, limit, include_scheduled }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -209,8 +243,10 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("get_post", "Egy adott Facebook bejegyzes reszleteit adja vissza.", {
+    page: pageParam,
     post_id: z.string().min(1),
-  }, async ({ post_id }) => {
+  }, async ({ page, post_id }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -223,6 +259,7 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("create_post", "Uj bejegyzest tesz koze az oldalon kepel vagy anelkul, vagy utemezi. A kep megadhato base64 kodolt stringkent (image_base64), nyilvanos URL-kent (image_url), vagy link-kent.", {
+    page: pageParam,
     message: z.string().min(1).max(63206),
     image_base64: z.string().optional(),
     image_mime_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]).optional().default("image/png"),
@@ -232,7 +269,8 @@ function createMcpServer(creds: Credentials): McpServer {
     published: z.boolean().optional().default(true),
     scheduled_publish_time: z.string().optional(),
     privacy: z.enum(["EVERYONE", "FRIENDS", "ONLY_ME"]).optional().default("EVERYONE"),
-  }, async ({ message, image_base64, image_mime_type, image_url, image_path, link, published, scheduled_publish_time, privacy }) => {
+  }, async ({ page, message, image_base64, image_mime_type, image_url, image_path, link, published, scheduled_publish_time, privacy }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -282,9 +320,11 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("update_post", "Meglevo bejegyzes szoveget modositja.", {
+    page: pageParam,
     post_id: z.string().min(1),
     message: z.string().min(1).max(63206),
-  }, async ({ post_id, message }) => {
+  }, async ({ page, post_id, message }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -296,8 +336,10 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("delete_post", "Torol egy bejegyzest az oldalrol. A muvelet visszavonhatatlan.", {
+    page: pageParam,
     post_id: z.string().min(1),
-  }, async ({ post_id }) => {
+  }, async ({ page, post_id }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -309,8 +351,10 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("publish_scheduled_post", "Egy korabban utemezett bejegyzest azonnal kozzétesz.", {
+    page: pageParam,
     post_id: z.string().min(1),
-  }, async ({ post_id }) => {
+  }, async ({ page, post_id }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -321,7 +365,8 @@ function createMcpServer(creds: Credentials): McpServer {
     }
   });
 
-  server.tool("get_page_info", "Visszaadja az oldal alapadatait.", {}, async () => {
+  server.tool("get_page_info", "Visszaadja az oldal alapadatait.", { page: pageParam }, async ({ page }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -333,7 +378,8 @@ function createMcpServer(creds: Credentials): McpServer {
     }
   });
 
-  server.tool("check_token", "Ellenorzi a Page Access Token ervenyet.", {}, async () => {
+  server.tool("check_token", "Ellenorzi a Page Access Token ervenyet.", { page: pageParam }, async ({ page }) => {
+    const creds = credsFor(page);
     if (!creds.appId || !creds.appSecret)
       return { content: [{ type: "text", text: "FB_APP_ID es FB_APP_SECRET szukseges." }], isError: true };
     const client = createClient(creds);
@@ -347,8 +393,10 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("get_post_insights", "Visszaadja egy bejegyzes statisztikait.", {
+    page: pageParam,
     post_id: z.string().min(1),
-  }, async ({ post_id }) => {
+  }, async ({ page, post_id }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -386,10 +434,12 @@ function createMcpServer(creds: Credentials): McpServer {
   });
 
   server.tool("get_page_insights", "Visszaadja az oldal osszesitett statisztikait.", {
+    page: pageParam,
     period: z.enum(["day","week","days_28","month","lifetime"]).optional().default("week"),
     since: z.string().optional(),
     until: z.string().optional(),
-  }, async ({ period, since, until }) => {
+  }, async ({ page, period, since, until }) => {
+    const creds = credsFor(page);
     assertCredentials(creds);
     const client = createClient(creds);
     try {
@@ -484,7 +534,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "meta-marketing-agent",
-    version: "2.5.0",
+    version: "3.0.0",
     // Csak a beallitott oldalak KULCSAI es page ID-jai — token soha nem kerul ki
     configured_pages: Object.fromEntries(
       Object.entries(PAGE_REGISTRY).map(([k, v]) => [k, v.id])
@@ -653,8 +703,7 @@ copyBtn.onclick=()=>{
 });
 
 app.post("/mcp", requireApiKeyMcp, async (req: Request, res: Response) => {
-  const creds = getCredentials(req);
-  const server = createMcpServer(creds);
+  const server = createMcpServer(req);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
   try {
