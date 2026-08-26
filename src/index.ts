@@ -151,33 +151,75 @@ function assertCredentials(creds: Credentials): void {
   throw new Error("A szerveren egyetlen oldal sincs beallitva (FB_PAGE_TOKEN_XX / FB_PAGE_ID_XX).");
 }
 
-async function uploadPhotoToFacebook(
+// ---------------------------------------------------------------------------
+// KETLEPESES KEPES POSZT — VALODI BEJEGYZES (Post), NEM ALBUMFOTO
+//
+// HIBA volt: a kepet kozvetlenul a /photos vegponton publikaltuk. Az igy
+// letrejovo objektum egy ALBUMFOTO (photo.php?fbid=...), NEM valodi oldal-
+// bejegyzes (Post). A Facebook nem general hozza rendes "sztorit", ezert:
+//   - a kep nem jelenik meg a "Bejegyzesek" kozt, csak a fotoalbumban
+//   - a kovetok HIRFOLYAMABA soha nem jut el
+//   - a valasz post_id-ja null, csak photo_id jott vissza
+//
+// HELYES eljaras (Facebook Graph API ajanlas):
+//   1. /{page-id}/photos  published=false          -> photo_id (nem publikus)
+//   2. /{page-id}/feed    attached_media[0]=...    -> VALODI Post
+// ---------------------------------------------------------------------------
+
+/** 1. lepes: kep feltoltese PUBLIKALATLANUL, nyers binarisbol. Visszaad: photo_id */
+async function uploadUnpublishedPhotoBinary(
   apiVersion: string,
   pageId: string,
   pageToken: string,
   imageBuffer: Buffer,
-  mimeType: string,
-  message: string,
-  published: boolean,
-  scheduledTs?: number
-): Promise<{ id: string; post_id?: string }> {
+  mimeType: string
+): Promise<string> {
   const ext = mimeType.split("/")[1] ?? "png";
   const fd = new globalThis.FormData();
   fd.append("source", new Blob([new Uint8Array(imageBuffer)], { type: mimeType }), "photo." + ext);
-  fd.append("message", message);
-  fd.append("published", String(published));
+  fd.append("published", "false");
   fd.append("access_token", pageToken);
-  if (!published && scheduledTs !== undefined) {
-    fd.append("scheduled_publish_time", String(scheduledTs));
-  }
   const url = "https://graph.facebook.com/" + apiVersion + "/" + pageId + "/photos";
-  const fetchRes = await fetch(url, { method: "POST", body: fd });
-  if (!fetchRes.ok) {
-    const errBody = await fetchRes.text();
-    throw new Error("Facebook API hiba (" + fetchRes.status + "): " + errBody);
-  }
-  return fetchRes.json() as Promise<{ id: string; post_id?: string }>;
+  const r = await fetch(url, { method: "POST", body: fd });
+  if (!r.ok) throw new Error("Facebook API hiba (kep feltoltes " + r.status + "): " + (await r.text()));
+  const data = (await r.json()) as { id: string };
+  if (!data.id) throw new Error("A Facebook nem adott vissza photo_id-t.");
+  return data.id;
 }
+
+/** 1. lepes URL-bol: kep feltoltese PUBLIKALATLANUL. Visszaad: photo_id */
+async function uploadUnpublishedPhotoByUrl(
+  client: AxiosInstance,
+  pageId: string,
+  imageUrl: string
+): Promise<string> {
+  const { data } = await client.post<{ id: string }>("/" + pageId + "/photos", {
+    url: imageUrl,
+    published: false,
+  });
+  if (!data.id) throw new Error("A Facebook nem adott vissza photo_id-t.");
+  return data.id;
+}
+
+/** 2. lepes: VALODI bejegyzes letrehozasa a /feed vegponton, csatolt fotoval */
+async function createFeedPostWithMedia(
+  client: AxiosInstance,
+  pageId: string,
+  message: string,
+  photoIds: string[],
+  published: boolean,
+  scheduledTs?: number
+): Promise<{ id: string }> {
+  const params: Record<string, unknown> = {
+    message,
+    published,
+    attached_media: photoIds.map((id) => ({ media_fbid: id })),
+  };
+  if (!published && scheduledTs !== undefined) params.scheduled_publish_time = scheduledTs;
+  const { data } = await client.post<{ id: string }>("/" + pageId + "/feed", params);
+  return data;
+}
+
 
 // Az oldalvalaszto parameter semaja — MINDEN tool megkapja.
 // Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
@@ -192,7 +234,7 @@ const pageParam = z
   );
 
 function createMcpServer(req: Request): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "3.0.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "3.1.0" });
 
   // Oldalankenti hitelesites feloldasa: elsodleges a tool 'page' parametere,
   // masodlagos az URL ?p= parametere, vegul a header / env default.
@@ -283,11 +325,14 @@ function createMcpServer(req: Request): McpServer {
       if (image_base64) {
         const buffer = Buffer.from(image_base64, "base64");
         const mimeType = image_mime_type ?? "image/png";
-        const resData = await uploadPhotoToFacebook(
-          creds.apiVersion, creds.pageId, creds.pageToken,
-          buffer, mimeType, message, published, scheduledTs
+        // 1. publikalatlan fotofeltoltes -> 2. valodi Post a /feed vegponton
+        const photoId = await uploadUnpublishedPhotoBinary(
+          creds.apiVersion, creds.pageId, creds.pageToken, buffer, mimeType
         );
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (base64 kep)" : "Utemezve (base64 kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
+        const post = await createFeedPostWithMedia(
+          client, creds.pageId, message, [photoId], published, scheduledTs
+        );
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (valodi bejegyzes, base64 kep)" : "Utemezve (valodi bejegyzes, base64 kep)", post_id: post.id, photo_id: photoId }, null, 2) }] };
       }
 
       if (image_path) {
@@ -295,18 +340,22 @@ function createMcpServer(req: Request): McpServer {
         const fileBuffer = readFileSync(image_path);
         const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
         const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
-        const resData = await uploadPhotoToFacebook(
-          creds.apiVersion, creds.pageId, creds.pageToken,
-          fileBuffer, mimeType, message, published, scheduledTs
+        const photoId = await uploadUnpublishedPhotoBinary(
+          creds.apiVersion, creds.pageId, creds.pageToken, fileBuffer, mimeType
         );
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (lokalis kep)" : "Utemezve (lokalis kep)", photo_id: resData.id, post_id: resData.post_id ?? null }, null, 2) }] };
+        const post = await createFeedPostWithMedia(
+          client, creds.pageId, message, [photoId], published, scheduledTs
+        );
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (valodi bejegyzes, lokalis kep)" : "Utemezve (valodi bejegyzes, lokalis kep)", post_id: post.id, photo_id: photoId }, null, 2) }] };
       }
 
       if (image_url) {
-        const photoParams: Record<string, unknown> = { message, url: image_url, published };
-        if (scheduledTs !== undefined) photoParams.scheduled_publish_time = scheduledTs;
-        const { data } = await client.post<{ id: string; post_id?: string }>("/" + creds.pageId + "/photos", photoParams);
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (URL-kep)" : "Utemezve (URL-kep)", photo_id: data.id, post_id: data.post_id ?? null }, null, 2) }] };
+        // 1. publikalatlan fotofeltoltes URL-bol -> 2. valodi Post a /feed vegponton
+        const photoId = await uploadUnpublishedPhotoByUrl(client, creds.pageId, image_url);
+        const post = await createFeedPostWithMedia(
+          client, creds.pageId, message, [photoId], published, scheduledTs
+        );
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (valodi bejegyzes, URL-kep)" : "Utemezve (valodi bejegyzes, URL-kep)", post_id: post.id, photo_id: photoId }, null, 2) }] };
       }
 
       const params: Record<string, unknown> = { message, published, privacy: JSON.stringify({ value: privacy ?? "EVERYONE" }) };
@@ -534,7 +583,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "meta-marketing-agent",
-    version: "3.0.0",
+    version: "3.1.0",
     // Csak a beallitott oldalak KULCSAI es page ID-jai — token soha nem kerul ki
     configured_pages: Object.fromEntries(
       Object.entries(PAGE_REGISTRY).map(([k, v]) => [k, v.id])
@@ -571,11 +620,13 @@ app.post("/upload-image", requireApiKey, express.raw({ type: ["image/*", "applic
         return;
       }
     }
-    const result = await uploadPhotoToFacebook(
-      creds.apiVersion, creds.pageId, creds.pageToken,
-      imageBuffer, mimeType, message, published, scheduledTs
+    const photoId = await uploadUnpublishedPhotoBinary(
+      creds.apiVersion, creds.pageId, creds.pageToken, imageBuffer, mimeType
     );
-    res.json({ success: true, photo_id: result.id, post_id: result.post_id ?? null });
+    const post = await createFeedPostWithMedia(
+      createClient(creds), creds.pageId, message, [photoId], published, scheduledTs
+    );
+    res.json({ success: true, post_id: post.id, photo_id: photoId });
   } catch (err) {
     res.status(500).json({ success: false, error: extractError(err) });
   }
