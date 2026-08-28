@@ -30,18 +30,26 @@ const DEFAULT_PAGE_ID = process.env.FB_PAGE_ID ?? "";
 // Igy a plugin .mcp.json fajlba nem kell titkot tenni, es a mukodes nem fugg
 // attol, hogy a kliens tovabbitja-e a custom headereket.
 // ---------------------------------------------------------------------------
-const PAGE_KEYS = ["hu", "de", "at", "fr", "it", "ro", "es"] as const;
-type PageKey = (typeof PAGE_KEYS)[number];
+interface PageCreds { token: string; id: string; name?: string; }
 
-interface PageCreds { token: string; id: string; }
-
+// A nyilvantartas DINAMIKUS: a kornyezeti valtozokbol epul fel, nem kodbol.
+// Uj oldal hozzaadasa = 2 (opcionalisan 3) env valtozo, KODMODOSITAS NELKUL:
+//   FB_PAGE_TOKEN_<KULCS>   (kotelezo)  pl. FB_PAGE_TOKEN_AIP_CZ
+//   FB_PAGE_ID_<KULCS>      (kotelezo)  pl. FB_PAGE_ID_AIP_CZ
+//   FB_PAGE_NAME_<KULCS>    (opcionalis) pl. "All In Packaging Cesko"
+// A tool 'page' parametere a kulcs kisbetus formaja: aip_cz
 const PAGE_REGISTRY: Record<string, PageCreds> = {};
-for (const k of PAGE_KEYS) {
-  const up = k.toUpperCase();
-  const token = process.env[`FB_PAGE_TOKEN_${up}`] ?? "";
+for (const envKey of Object.keys(process.env)) {
+  const m = /^FB_PAGE_TOKEN_([A-Z0-9_]+)$/.exec(envKey);
+  if (!m) continue;
+  const up = m[1];
+  const token = process.env[envKey] ?? "";
   const id = process.env[`FB_PAGE_ID_${up}`] ?? "";
-  if (token && id) PAGE_REGISTRY[k] = { token, id };
+  const name = process.env[`FB_PAGE_NAME_${up}`];
+  if (token && id) PAGE_REGISTRY[up.toLowerCase()] = { token, id, name };
 }
+
+const PAGE_KEYS = Object.keys(PAGE_REGISTRY).sort();
 
 function resolvePage(req: Request): PageCreds | null {
   const raw = req.query?.p;
@@ -224,17 +232,26 @@ async function createFeedPostWithMedia(
 // Az oldalvalaszto parameter semaja — MINDEN tool megkapja.
 // Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
 // amibol a kliensnel gyakran csak nehany epult fel.
-const pageParam = z
-  .enum(PAGE_KEYS)
+const PAGE_DESC =
+  PAGE_KEYS.length > 0
+    ? "Melyik Facebook oldal. Elerheto kulcsok: " +
+      PAGE_KEYS.map((k) => {
+        const n = PAGE_REGISTRY[k].name;
+        return n ? `${k} (${n})` : k;
+      }).join(", ") +
+      ". Kotelezo megadni. A pontos listat a list_pages tool adja vissza."
+    : "A szerveren egyetlen oldal sincs beallitva.";
+
+const pageParam = (
+  PAGE_KEYS.length > 0
+    ? z.enum(PAGE_KEYS as [string, ...string[]])
+    : z.string()
+)
   .optional()
-  .describe(
-    "Melyik Facebook oldal: hu (Allinhoreca Magyar), de (Deutschland), at (Osterreich), " +
-    "fr (France), it (Italia), ro (Romania), es (Espana & Portugal). " +
-    "Kotelezo megadni, kiveve ha az URL ?p= parametere mar meghatarozza."
-  );
+  .describe(PAGE_DESC);
 
 function createMcpServer(req: Request): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "3.1.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "3.2.0" });
 
   // Oldalankenti hitelesites feloldasa: elsodleges a tool 'page' parametere,
   // masodlagos az URL ?p= parametere, vegul a header / env default.
@@ -250,6 +267,24 @@ function createMcpServer(req: Request): McpServer {
     }
     return base;
   };
+
+  server.tool(
+    "list_pages",
+    "Kilistazza az OSSZES elerheto Facebook oldalt: a 'page' parameterhez hasznalhato kulcsot, az oldal nevet es a Facebook page ID-t. Ezt hasznald, ha nem tudod milyen oldalak vannak, vagy ha a felhasznalo azt kerdezi mely oldalakat kezeljuk.",
+    {},
+    async () => {
+      const pages = PAGE_KEYS.map((k) => ({
+        page: k,
+        name: PAGE_REGISTRY[k].name ?? null,
+        page_id: PAGE_REGISTRY[k].id,
+      }));
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ total: pages.length, pages }, null, 2) },
+        ],
+      };
+    }
+  );
 
   server.tool("list_posts", "Visszaadja az oldal legutobb bejegyzeseit.", {
     page: pageParam,
@@ -583,10 +618,11 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "meta-marketing-agent",
-    version: "3.1.0",
+    version: "3.2.0",
     // Csak a beallitott oldalak KULCSAI es page ID-jai — token soha nem kerul ki
+    total_pages: PAGE_KEYS.length,
     configured_pages: Object.fromEntries(
-      Object.entries(PAGE_REGISTRY).map(([k, v]) => [k, v.id])
+      PAGE_KEYS.map((k) => [k, { id: PAGE_REGISTRY[k].id, name: PAGE_REGISTRY[k].name ?? null }])
     ),
   });
 });
