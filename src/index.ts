@@ -38,24 +38,69 @@ interface PageCreds { token: string; id: string; name?: string; }
 //   FB_PAGE_ID_<KULCS>      (kotelezo)  pl. FB_PAGE_ID_AIP_CZ
 //   FB_PAGE_NAME_<KULCS>    (opcionalis) pl. "All In Packaging Cesko"
 // A tool 'page' parametere a kulcs kisbetus formaja: aip_cz
-const PAGE_REGISTRY: Record<string, PageCreds> = {};
+type TenantPages = Record<string, PageCreds>;
+
+// Ha a keres nem ad meg ceget (?t=), ez a ceg lesz hasznalva.
+// EZ BIZTOSITJA A VISSZAFELE KOMPATIBILITAST: a mar kiadott pluginok URL-je
+// nem tartalmaz ?t= parametert, azok tovabbra is ehhez a ceghez tartoznak.
+const DEFAULT_TENANT = (process.env.DEFAULT_TENANT ?? "nordtek").toLowerCase();
+
+// TENANTS[ceg][oldalkulcs] = { token, id, name }
+const TENANTS: Record<string, TenantPages> = {};
+
+function tenantBucket(t: string): TenantPages {
+  if (!TENANTS[t]) TENANTS[t] = {};
+  return TENANTS[t];
+}
+
 for (const envKey of Object.keys(process.env)) {
+  // (A) CEGES forma — ket alulvonas valasztja el a ceget es az oldalkulcsot:
+  //       FB_PAGE_TOKEN__<CEG>__<OLDALKULCS>
+  //       FB_PAGE_ID__<CEG>__<OLDALKULCS>
+  //       FB_PAGE_NAME__<CEG>__<OLDALKULCS>   (opcionalis)
+  //     A <CEG> csak betu/szam lehet (alulvonas nem), igy az elvalasztas egyertelmu.
+  //     Pl.: FB_PAGE_TOKEN__ACME__SHOP_DE  ->  ceg "acme", oldal "shop_de"
+  const mt = /^FB_PAGE_TOKEN__([A-Z0-9]+)__([A-Z0-9_]+)$/.exec(envKey);
+  if (mt) {
+    const T = mt[1];
+    const K = mt[2];
+    const token = process.env[envKey] ?? "";
+    const id = process.env[`FB_PAGE_ID__${T}__${K}`] ?? "";
+    const name = process.env[`FB_PAGE_NAME__${T}__${K}`];
+    if (token && id) tenantBucket(T.toLowerCase())[K.toLowerCase()] = { token, id, name };
+    continue; // FONTOS: ne essen at a regi mintara
+  }
+
+  // (B) REGI forma — VALTOZATLAN, a DEFAULT_TENANT ceghez kerul:
+  //       FB_PAGE_TOKEN_<OLDALKULCS>
   const m = /^FB_PAGE_TOKEN_([A-Z0-9_]+)$/.exec(envKey);
   if (!m) continue;
   const up = m[1];
   const token = process.env[envKey] ?? "";
   const id = process.env[`FB_PAGE_ID_${up}`] ?? "";
   const name = process.env[`FB_PAGE_NAME_${up}`];
-  if (token && id) PAGE_REGISTRY[up.toLowerCase()] = { token, id, name };
+  if (token && id) tenantBucket(DEFAULT_TENANT)[up.toLowerCase()] = { token, id, name };
 }
 
-const PAGE_KEYS = Object.keys(PAGE_REGISTRY).sort();
+const TENANT_KEYS = Object.keys(TENANTS).sort();
+
+/** Feloldja, melyik ceg keresese ez. null = ismeretlen ceg-azonosito. */
+function resolveTenant(req: Request): { key: string; pages: TenantPages } | null {
+  const raw = req.query?.t;
+  const val = Array.isArray(raw) ? raw[0] : raw;
+  const key = (typeof val === "string" && val.trim() ? val.trim() : DEFAULT_TENANT).toLowerCase();
+  const pages = TENANTS[key];
+  if (!pages) return null;
+  return { key, pages };
+}
 
 function resolvePage(req: Request): PageCreds | null {
+  const t = resolveTenant(req);
+  if (!t) return null;
   const raw = req.query?.p;
   const key = (Array.isArray(raw) ? raw[0] : raw);
   if (typeof key !== "string") return null;
-  return PAGE_REGISTRY[key.toLowerCase()] ?? null;
+  return t.pages[key.toLowerCase()] ?? null;
 }
 const DEFAULT_APP_ID = process.env.FB_APP_ID ?? "";
 const DEFAULT_APP_SECRET = process.env.FB_APP_SECRET ?? "";
@@ -149,14 +194,10 @@ function createClient(creds: Credentials): AxiosInstance {
 
 function assertCredentials(creds: Credentials): void {
   if (creds.pageToken && creds.pageId) return;
-  const avail = Object.keys(PAGE_REGISTRY);
-  if (avail.length) {
-    throw new Error(
-      "Nincs megadva melyik oldalra szol a muvelet. Add meg a 'page' parametert. " +
-      "Elerheto oldalak: " + avail.join(", ")
-    );
-  }
-  throw new Error("A szerveren egyetlen oldal sincs beallitva (FB_PAGE_TOKEN_XX / FB_PAGE_ID_XX).");
+  throw new Error(
+    "Nincs megadva melyik oldalra szol a muvelet. Add meg a 'page' parametert " +
+    "(a lehetoseget a list_pages tool adja vissza)."
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,36 +273,48 @@ async function createFeedPostWithMedia(
 // Az oldalvalaszto parameter semaja — MINDEN tool megkapja.
 // Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
 // amibol a kliensnel gyakran csak nehany epult fel.
-const PAGE_DESC =
-  PAGE_KEYS.length > 0
-    ? "Melyik Facebook oldal. Elerheto kulcsok: " +
-      PAGE_KEYS.map((k) => {
-        const n = PAGE_REGISTRY[k].name;
-        return n ? `${k} (${n})` : k;
-      }).join(", ") +
-      ". Kotelezo megadni. A pontos listat a list_pages tool adja vissza."
-    : "A szerveren egyetlen oldal sincs beallitva.";
-
-const pageParam = (
-  PAGE_KEYS.length > 0
-    ? z.enum(PAGE_KEYS as [string, ...string[]])
-    : z.string()
-)
-  .optional()
-  .describe(PAGE_DESC);
-
 function createMcpServer(req: Request): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "3.2.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "4.0.0" });
+
+  // A keresbol feloldjuk a ceget. Nincs ?t= -> DEFAULT_TENANT (visszafele kompatibilis).
+  // Ismeretlen ?t= -> tenant null, es MINDEN muvelet beszedes hibat ad (nincs csendes
+  // visszaesés mas ceg adataira).
+  const tenant = resolveTenant(req);
+  const pages: TenantPages = tenant?.pages ?? {};
+  const pageKeys = Object.keys(pages).sort();
+
+  const pageDesc =
+    pageKeys.length > 0
+      ? "Melyik Facebook oldal. Elerheto kulcsok: " +
+        pageKeys.map((k) => {
+          const n = pages[k].name;
+          return n ? `${k} (${n})` : k;
+        }).join(", ") +
+        ". Kotelezo megadni. A pontos listat a list_pages tool adja vissza."
+      : "Ehhez a ceghez egyetlen oldal sincs beallitva.";
+
+  const pageParam = (
+    pageKeys.length > 0 ? z.enum(pageKeys as [string, ...string[]]) : z.string()
+  )
+    .optional()
+    .describe(pageDesc);
 
   // Oldalankenti hitelesites feloldasa: elsodleges a tool 'page' parametere,
   // masodlagos az URL ?p= parametere, vegul a header / env default.
   const credsFor = (page?: string): Credentials => {
+    if (!tenant) {
+      // Szandekosan NEM listazzuk a tobbi ceg nevet — az mas ugyfel adata.
+      throw new Error(
+        "Ismeretlen ceg-azonosito a ?t= parameterben. Ellenorizd a plugin .mcp.json URL-jet."
+      );
+    }
     const base = getCredentials(req);
     if (page) {
-      const pc = PAGE_REGISTRY[page.toLowerCase()];
+      const pc = pages[page.toLowerCase()];
       if (!pc) {
-        const avail = Object.keys(PAGE_REGISTRY).join(", ") || "(egy sincs beallitva)";
-        throw new Error(`Ismeretlen oldal: '${page}'. Elerheto oldalak: ${avail}`);
+        throw new Error(
+          `Ismeretlen oldal: '${page}'. Elerheto oldalak: ${pageKeys.join(", ") || "(egy sincs)"}`
+        );
       }
       return { ...base, pageToken: pc.token, pageId: pc.id };
     }
@@ -273,14 +326,22 @@ function createMcpServer(req: Request): McpServer {
     "Kilistazza az OSSZES elerheto Facebook oldalt: a 'page' parameterhez hasznalhato kulcsot, az oldal nevet es a Facebook page ID-t. Ezt hasznald, ha nem tudod milyen oldalak vannak, vagy ha a felhasznalo azt kerdezi mely oldalakat kezeljuk.",
     {},
     async () => {
-      const pages = PAGE_KEYS.map((k) => ({
+      if (!tenant) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: "Ismeretlen ceg-azonosito a ?t= parameterben. Ellenorizd a plugin .mcp.json URL-jet.",
+          }, null, 2) }],
+          isError: true,
+        };
+      }
+      const list = pageKeys.map((k) => ({
         page: k,
-        name: PAGE_REGISTRY[k].name ?? null,
-        page_id: PAGE_REGISTRY[k].id,
+        name: pages[k].name ?? null,
+        page_id: pages[k].id,
       }));
       return {
         content: [
-          { type: "text", text: JSON.stringify({ total: pages.length, pages }, null, 2) },
+          { type: "text", text: JSON.stringify({ ceg: tenant.key, total: list.length, pages: list }, null, 2) },
         ],
       };
     }
@@ -614,15 +675,29 @@ function requireApiKeyMcp(req: Request, res: Response, next: () => void): void {
   next();
 }
 
-app.get("/health", (_req, res) => {
-  res.json({
+app.get("/health", (req: Request, res: Response) => {
+  // Alapbol csak osszesito adat — nem listazunk ki minden ceget es oldalt
+  // nyilvanosan. Egy konkret ceg oldalai: /health?t=<ceg>
+  // Token SOHA nem kerul ki.
+  const base = {
     status: "ok",
     service: "meta-marketing-agent",
-    version: "3.2.0",
-    // Csak a beallitott oldalak KULCSAI es page ID-jai — token soha nem kerul ki
-    total_pages: PAGE_KEYS.length,
-    configured_pages: Object.fromEntries(
-      PAGE_KEYS.map((k) => [k, { id: PAGE_REGISTRY[k].id, name: PAGE_REGISTRY[k].name ?? null }])
+    version: "4.0.0",
+    default_tenant: DEFAULT_TENANT,
+    total_tenants: TENANT_KEYS.length,
+    total_pages: TENANT_KEYS.reduce((n, t) => n + Object.keys(TENANTS[t]).length, 0),
+  };
+  const raw = req.query?.t;
+  const val = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof val !== "string" || !val.trim()) { res.json(base); return; }
+  const key = val.trim().toLowerCase();
+  const pages = TENANTS[key];
+  if (!pages) { res.json({ ...base, tenant: key, error: "Ismeretlen ceg-azonosito." }); return; }
+  res.json({
+    ...base,
+    tenant: key,
+    pages: Object.fromEntries(
+      Object.keys(pages).sort().map((k) => [k, { id: pages[k].id, name: pages[k].name ?? null }])
     ),
   });
 });
