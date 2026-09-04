@@ -84,6 +84,24 @@ for (const envKey of Object.keys(process.env)) {
 
 const TENANT_KEYS = Object.keys(TENANTS).sort();
 
+// Cegenkenti Facebook App adatok (opcionalis).
+// Ha egy ceg sajat Facebook App-ot hasznal, add meg ezeket:
+//   FB_APP_ID__<CEG>       pl. FB_APP_ID__MENUISTA
+//   FB_APP_SECRET__<CEG>   pl. FB_APP_SECRET__MENUISTA
+// Ha nincs megadva, a globalis FB_APP_ID / FB_APP_SECRET ervenyes.
+// Ez azert kell, mert a check_token a app_id|app_secret parossal ellenorzi a
+// page tokent — ha a ket adat mas apphoz tartozik, a hivas hibat ad.
+interface AppCreds { appId: string; appSecret: string; }
+const TENANT_APPS: Record<string, AppCreds> = {};
+for (const envKey of Object.keys(process.env)) {
+  const m = /^FB_APP_ID__([A-Z0-9]+)$/.exec(envKey);
+  if (!m) continue;
+  const T = m[1];
+  const appId = process.env[envKey] ?? "";
+  const appSecret = process.env[`FB_APP_SECRET__${T}`] ?? "";
+  if (appId && appSecret) TENANT_APPS[T.toLowerCase()] = { appId, appSecret };
+}
+
 /** Feloldja, melyik ceg keresese ez. null = ismeretlen ceg-azonosito. */
 function resolveTenant(req: Request): { key: string; pages: TenantPages } | null {
   const raw = req.query?.t;
@@ -150,11 +168,15 @@ function getCredentials(req: Request): Credentials {
   //          2) kliens header (visszafele kompatibilitas)
   //          3) egyetlen env default
   const page = resolvePage(req);
+  const t = resolveTenant(req);
+  const app = t ? TENANT_APPS[t.key] : undefined;
   return {
     pageToken: page?.token || (req.headers["x-fb-page-access-token"] as string) || DEFAULT_PAGE_TOKEN,
     pageId: page?.id || (req.headers["x-fb-page-id"] as string) || DEFAULT_PAGE_ID,
-    appId: (req.headers["x-fb-app-id"] as string) || DEFAULT_APP_ID,
-    appSecret: (req.headers["x-fb-app-secret"] as string) || DEFAULT_APP_SECRET,
+    // A ceg sajat App-ja elsobbseget elvez — kulonben a check_token
+    // "App_id ... did not match" hibat adna.
+    appId: app?.appId || (req.headers["x-fb-app-id"] as string) || DEFAULT_APP_ID,
+    appSecret: app?.appSecret || (req.headers["x-fb-app-secret"] as string) || DEFAULT_APP_SECRET,
     apiVersion: (req.headers["x-fb-api-version"] as string) || DEFAULT_API_VERSION,
   };
 }
@@ -274,7 +296,7 @@ async function createFeedPostWithMedia(
 // Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
 // amibol a kliensnel gyakran csak nehany epult fel.
 function createMcpServer(req: Request): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "4.0.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "4.1.0" });
 
   // A keresbol feloldjuk a ceget. Nincs ?t= -> DEFAULT_TENANT (visszafele kompatibilis).
   // Ismeretlen ?t= -> tenant null, es MINDEN muvelet beszedes hibat ad (nincs csendes
@@ -682,7 +704,7 @@ app.get("/health", (req: Request, res: Response) => {
   const base = {
     status: "ok",
     service: "meta-marketing-agent",
-    version: "4.0.0",
+    version: "4.1.0",
     default_tenant: DEFAULT_TENANT,
     total_tenants: TENANT_KEYS.length,
     total_pages: TENANT_KEYS.reduce((n, t) => n + Object.keys(TENANTS[t]).length, 0),
