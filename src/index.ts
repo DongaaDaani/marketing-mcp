@@ -254,6 +254,41 @@ function assertCredentials(creds: Credentials): void {
  * A kepet ezert MINDIG eloszor a sajat CDN-re toltjuk fel (uploadToSpaces), es az igy
  * kapott nyilvanos URL-t adjuk at a Facebooknak.
  */
+/**
+ * UTEMEZETT kepes poszt — ketlepeses /feed + attached_media.
+ *
+ * MIERT MASKEPP, MINT AZ AZONNALI: a Meta Business Suite TERVEZO (Planner)
+ * naptarnezete csak akkor mutatja az utemezett posztot, ha az a /feed vegponton,
+ * attached_media-val jott letre. A /photos + scheduled_publish_time utemezes az
+ * API-ban helyes (ott van a /scheduled_posts listaban, es ki is megy), de a
+ * Tervezoben NEM rajzolodik ki — elo A/B teszttel ellenorizve.
+ *
+ * Kikuldes utan az igy letrejovo poszt rendesen viselkedik: /posts/ permalink,
+ * publikus, szerepel a published_posts kozott, mas felhasznalok is latjak.
+ * (Korabban ugy tunt, hogy ez a modszer elrontja a lathatosagot — valojaban az
+ * okozta, hogy a Facebook App fejlesztoi modban volt.)
+ */
+async function schedulePhotoPostByUrl(
+  client: AxiosInstance,
+  pageId: string,
+  message: string,
+  imageUrl: string,
+  scheduledTs: number
+): Promise<{ id: string }> {
+  const { data: photo } = await client.post<{ id: string }>("/" + pageId + "/photos", {
+    url: imageUrl,
+    published: false,
+  });
+  if (!photo.id) throw new Error("A Facebook nem adott vissza photo_id-t az utemezeshez.");
+  const { data } = await client.post<{ id: string }>("/" + pageId + "/feed", {
+    message,
+    attached_media: [{ media_fbid: photo.id }],
+    published: false,
+    scheduled_publish_time: scheduledTs,
+  });
+  return data;
+}
+
 async function publishPhotoPostByUrl(
   client: AxiosInstance,
   pageId: string,
@@ -276,7 +311,7 @@ async function publishPhotoPostByUrl(
 // Igy egyetlen connector kezeli mind a 7 oldalt: nem kell 7 kulon MCP kapcsolat,
 // amibol a kliensnel gyakran csak nehany epult fel.
 function createMcpServer(req: Request): McpServer {
-  const server = new McpServer({ name: "meta-marketing-agent", version: "4.2.0" });
+  const server = new McpServer({ name: "meta-marketing-agent", version: "4.3.0" });
 
   // A keresbol feloldjuk a ceget. Nincs ?t= -> DEFAULT_TENANT (visszafele kompatibilis).
   // Ismeretlen ?t= -> tenant null, es MINDEN muvelet beszedes hibat ad (nincs csendes
@@ -425,8 +460,12 @@ function createMcpServer(req: Request): McpServer {
         const mimeType = image_mime_type ?? "image/png";
         // Elobb a sajat CDN-re, majd egylepeses /photos url-lel (valodi hirfolyam-story)
         const cdnUrl = await uploadToSpaces(buffer, mimeType);
+        if (!published && scheduledTs !== undefined) {
+          const sch = await schedulePhotoPostByUrl(client, creds.pageId, message, cdnUrl, scheduledTs);
+          return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Utemezve (Tervezoben is lathato, base64 kep)", post_id: sch.id, image_url: cdnUrl }, null, 2) }] };
+        }
         const res = await publishPhotoPostByUrl(client, creds.pageId, message, cdnUrl, published, scheduledTs);
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (hirfolyam-poszt, base64 kep)" : "Utemezve (hirfolyam-poszt, base64 kep)", post_id: res.post_id ?? null, photo_id: res.id, image_url: cdnUrl }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Kozzetve (hirfolyam-poszt, base64 kep)", post_id: res.post_id ?? null, photo_id: res.id, image_url: cdnUrl }, null, 2) }] };
       }
 
       if (image_path) {
@@ -435,13 +474,21 @@ function createMcpServer(req: Request): McpServer {
         const ext = extname(image_path).toLowerCase().replace(".", "") || "jpeg";
         const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/jpeg";
         const cdnUrl = await uploadToSpaces(fileBuffer, mimeType);
+        if (!published && scheduledTs !== undefined) {
+          const sch = await schedulePhotoPostByUrl(client, creds.pageId, message, cdnUrl, scheduledTs);
+          return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Utemezve (Tervezoben is lathato, lokalis kep)", post_id: sch.id, image_url: cdnUrl }, null, 2) }] };
+        }
         const res = await publishPhotoPostByUrl(client, creds.pageId, message, cdnUrl, published, scheduledTs);
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (hirfolyam-poszt, lokalis kep)" : "Utemezve (hirfolyam-poszt, lokalis kep)", post_id: res.post_id ?? null, photo_id: res.id, image_url: cdnUrl }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Kozzetve (hirfolyam-poszt, lokalis kep)", post_id: res.post_id ?? null, photo_id: res.id, image_url: cdnUrl }, null, 2) }] };
       }
 
       if (image_url) {
+        if (!published && scheduledTs !== undefined) {
+          const sch = await schedulePhotoPostByUrl(client, creds.pageId, message, image_url, scheduledTs);
+          return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Utemezve (Tervezoben is lathato, URL-kep)", post_id: sch.id }, null, 2) }] };
+        }
         const res = await publishPhotoPostByUrl(client, creds.pageId, message, image_url, published, scheduledTs);
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: published ? "Kozzetve (hirfolyam-poszt, URL-kep)" : "Utemezve (hirfolyam-poszt, URL-kep)", post_id: res.post_id ?? null, photo_id: res.id }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ success: true, action: "Kozzetve (hirfolyam-poszt, URL-kep)", post_id: res.post_id ?? null, photo_id: res.id }, null, 2) }] };
       }
 
       const params: Record<string, unknown> = { message, published, privacy: JSON.stringify({ value: privacy ?? "EVERYONE" }) };
@@ -672,7 +719,7 @@ app.get("/health", (req: Request, res: Response) => {
   const base = {
     status: "ok",
     service: "meta-marketing-agent",
-    version: "4.2.0",
+    version: "4.3.0",
     default_tenant: DEFAULT_TENANT,
     total_tenants: TENANT_KEYS.length,
     total_pages: TENANT_KEYS.reduce((n, t) => n + Object.keys(TENANTS[t]).length, 0),
